@@ -6,8 +6,7 @@ forwards chat to the deployed agent over the A2A protocol, returning replies as
 structured parts the chat UI knows how to show:
 
   * {"kind": "text", "text": ...}  -> a normal chat bubble
-  * {"kind": "a2ui", "data": ...}  -> one A2UI message (beginRendering /
-    surfaceUpdate); static/index.html renders these as a card.
+  * {"kind": "a2ui", "data": ...}  -> one A2UI message (beginRendering / surfaceUpdate or surfaceId/components)
 """
 
 import base64
@@ -66,7 +65,32 @@ async def _json_errors(request: Request, exc: Exception):
     )
 
 
-_contexts: dict[str, str] = {}
+def _parse_text_for_a2ui(text: str) -> list[dict]:
+    out: list[dict] = []
+    if not text:
+        return out
+    if "<a2ui-json>" in text and "</a2ui-json>" in text:
+        try:
+            chunks = text.split("<a2ui-json>")
+            for i, chunk in enumerate(chunks):
+                if "</a2ui-json>" in chunk:
+                    json_str, rest = chunk.split("</a2ui-json>", 1)
+                    json_str = json_str.strip()
+                    try:
+                        a2ui_obj = json.loads(json_str)
+                        out.append({"kind": "a2ui", "data": a2ui_obj})
+                    except Exception:
+                        out.append({"kind": "text", "text": f"<a2ui-json>{json_str}</a2ui-json>"})
+                    if rest.strip():
+                        out.append({"kind": "text", "text": rest.strip()})
+                else:
+                    if chunk.strip():
+                        out.append({"kind": "text", "text": chunk.strip()})
+            return out
+        except Exception:
+            pass
+    out.append({"kind": "text", "text": text})
+    return out
 
 
 def _extract_parts_from_artifact(artifact) -> list[dict]:
@@ -77,7 +101,7 @@ def _extract_parts_from_artifact(artifact) -> list[dict]:
     for p in art_dict.get("parts", []):
         text = p.get("text")
         if text:
-            out.append({"kind": "text", "text": text})
+            out.extend(_parse_text_for_a2ui(text))
 
         data_field = p.get("data")
         if isinstance(data_field, dict):
@@ -87,12 +111,12 @@ def _extract_parts_from_artifact(artifact) -> list[dict]:
             if (mime == _A2UI_MIME or "a2ui" in str(mime)) and a2ui_data:
                 out.append({"kind": "a2ui", "data": a2ui_data})
             elif "text" in data_field:
-                out.append({"kind": "text", "text": str(data_field["text"])})
+                out.extend(_parse_text_for_a2ui(str(data_field["text"])))
         elif isinstance(data_field, str):
             try:
                 out.append({"kind": "a2ui", "data": json.loads(data_field)})
             except Exception:
-                out.append({"kind": "text", "text": data_field})
+                out.extend(_parse_text_for_a2ui(data_field))
     return out
 
 
@@ -104,7 +128,7 @@ def _extract_parts_from_message(msg) -> list[dict]:
     for p in msg_dict.get("parts", []):
         text = p.get("text")
         if text:
-            out.append({"kind": "text", "text": text})
+            out.extend(_parse_text_for_a2ui(text))
     return out
 
 
@@ -113,7 +137,6 @@ async def chat(req: Request):
     body = await req.json()
     message = body.get("message", "")
     image_data = body.get("image_data") or body.get("image")
-    user_id = body.get("user_id") or "web-user"
     parts: list[dict] = []
 
     msg_parts: list[Part] = []
@@ -142,16 +165,11 @@ async def chat(req: Request):
             client_config=ClientConfig(httpx_client=client),
         )
 
-        ctx_id = _contexts.get(user_id)
-        msg_kwargs = {
-            "message_id": str(uuid.uuid4()),
-            "role": Role.ROLE_USER,
-            "parts": msg_parts,
-        }
-        if ctx_id:
-            msg_kwargs["context_id"] = ctx_id
-
-        msg = Message(**msg_kwargs)
+        msg = Message(
+            message_id=str(uuid.uuid4()),
+            role=Role.ROLE_USER,
+            parts=msg_parts,
+        )
 
         last_task = None
         async for event in a2a_client.send_message(SendMessageRequest(message=msg)):
@@ -166,8 +184,6 @@ async def chat(req: Request):
                     parts.extend(_extract_parts_from_message(event.status_update.status.message))
                 if event.HasField("task"):
                     last_task = event.task
-                    if event.task.context_id:
-                        _contexts[user_id] = event.task.context_id
 
         if not parts and last_task is not None:
             for msg_item in last_task.history:
